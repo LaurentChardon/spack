@@ -74,9 +74,8 @@ from typing import (
     overload,
 )
 
-from typing_extensions import Literal
-
-import archspec.cpu
+import _vendoring.archspec.cpu
+from _vendoring.typing_extensions import Literal
 
 import llnl.path
 import llnl.string
@@ -217,10 +216,12 @@ def ensure_modern_format_string(fmt: str) -> None:
         )
 
 
-def _make_microarchitecture(name: str) -> archspec.cpu.Microarchitecture:
-    if isinstance(name, archspec.cpu.Microarchitecture):
+def _make_microarchitecture(name: str) -> _vendoring.archspec.cpu.Microarchitecture:
+    if isinstance(name, _vendoring.archspec.cpu.Microarchitecture):
         return name
-    return archspec.cpu.TARGETS.get(name, archspec.cpu.generic_microarchitecture(name))
+    return _vendoring.archspec.cpu.TARGETS.get(
+        name, _vendoring.archspec.cpu.generic_microarchitecture(name)
+    )
 
 
 @lang.lazy_lexicographic_ordering
@@ -364,7 +365,7 @@ class ArchSpec:
         # will assumed to be the host machine's platform.
 
         def target_or_none(t):
-            if isinstance(t, archspec.cpu.Microarchitecture):
+            if isinstance(t, _vendoring.archspec.cpu.Microarchitecture):
                 return t
             if t and t != "None":
                 return _make_microarchitecture(t)
@@ -837,7 +838,7 @@ def _shared_subset_pair_iterate(container1, container2):
                 b_idx += 1
 
 
-class FlagMap(lang.HashableMap):
+class FlagMap(lang.HashableMap[str, List[CompilerFlag]]):
     __slots__ = ("spec",)
 
     def __init__(self, spec):
@@ -961,7 +962,6 @@ def _sort_by_dep_types(dspec: DependencySpec):
     return dspec.depflag
 
 
-@lang.lazy_lexicographic_ordering
 class _EdgeMap(collections.abc.Mapping):
     """Represent a collection of edges (DependencySpec objects) in the DAG.
 
@@ -998,21 +998,6 @@ class _EdgeMap(collections.abc.Mapping):
 
     def __str__(self) -> str:
         return f"{{deps: {', '.join(str(d) for d in sorted(self.values()))}}}"
-
-    def _cmp_iter(self):
-        for item in sorted(itertools.chain.from_iterable(self.edges.values())):
-            yield item
-
-    def copy(self):
-        """Copies this object and returns a clone"""
-        clone = type(self)()
-        clone.store_by_child = self.store_by_child
-
-        # Copy everything from this dict into it.
-        for dspec in itertools.chain.from_iterable(self.values()):
-            clone.add(dspec.copy())
-
-        return clone
 
     def select(
         self,
@@ -1429,7 +1414,7 @@ class SpecAnnotations:
     def __repr__(self) -> str:
         result = f"SpecAnnotations().with_spec_format({self.original_spec_format})"
         if self.compiler_node_attribute:
-            result += f"with_compiler({str(self.compiler_node_attribute)})"
+            result += f".with_compiler({str(self.compiler_node_attribute)})"
         return result
 
 
@@ -1698,7 +1683,9 @@ class Spec:
             result[key] = list(group)
         return result
 
-    def _add_flag(self, name: str, value: str, propagate: bool, concrete: bool) -> None:
+    def _add_flag(
+        self, name: str, value: Union[str, bool], propagate: bool, concrete: bool
+    ) -> None:
         """Called by the parser to add a known flag"""
 
         if propagate and name in vt.RESERVED_NAMES:
@@ -1708,6 +1695,7 @@ class Spec:
 
         valid_flags = FlagMap.valid_compiler_flags()
         if name == "arch" or name == "architecture":
+            assert type(value) is str, "architecture have a string value"
             parts = tuple(value.split("-"))
             plat, os, tgt = parts if len(parts) == 3 else (None, None, value)
             self._set_architecture(platform=plat, os=os, target=tgt)
@@ -1721,17 +1709,15 @@ class Spec:
             self.namespace = value
         elif name in valid_flags:
             assert self.compiler_flags is not None
+            assert type(value) is str, f"{name} must have a string value"
             flags_and_propagation = spack.compilers.flags.tokenize_flags(value, propagate)
             flag_group = " ".join(x for (x, y) in flags_and_propagation)
             for flag, propagation in flags_and_propagation:
                 self.compiler_flags.add_flag(name, flag, propagation, flag_group)
         else:
-            if str(value).upper() == "TRUE" or str(value).upper() == "FALSE":
-                self.variants[name] = vt.BoolValuedVariant(name, value, propagate)
-            elif concrete:
-                self.variants[name] = vt.MultiValuedVariant(name, value, propagate)
-            else:
-                self.variants[name] = vt.VariantBase(name, value, propagate)
+            self.variants[name] = vt.VariantValue.from_string_or_bool(
+                name, value, propagate=propagate, concrete=concrete
+            )
 
     def _set_architecture(self, **kwargs):
         """Called by the parser to set the architecture."""
@@ -1860,9 +1846,7 @@ class Spec:
     @property
     def fullname(self):
         return (
-            ("%s.%s" % (self.namespace, self.name))
-            if self.namespace
-            else (self.name if self.name else "")
+            f"{self.namespace}.{self.name}" if self.namespace else (self.name if self.name else "")
         )
 
     @property
@@ -2234,15 +2218,21 @@ class Spec:
             spec._dup(self._lookup_hash())
             return spec
 
-        # Get dependencies that need to be replaced
-        for node in self.traverse(root=False):
-            if node.abstract_hash:
-                spec._add_dependency(node._lookup_hash(), depflag=0, virtuals=())
+        # Map the dependencies that need to be replaced
+        node_lookup = {
+            id(node): node._lookup_hash()
+            for node in self.traverse(root=False)
+            if node.abstract_hash
+        }
 
-        # reattach nodes that were not otherwise satisfied by new dependencies
-        for node in self.traverse(root=False):
-            if not any(n.satisfies(node) for n in spec.traverse()):
-                spec._add_dependency(node.copy(), depflag=0, virtuals=())
+        # Reconstruct dependencies
+        for edge in self.traverse_edges(root=False):
+            key = edge.parent.name
+            current_node = spec if key == spec.name else spec[key]
+            child_node = node_lookup.get(id(edge.spec), edge.spec.copy())
+            current_node._add_dependency(
+                child_node, depflag=edge.depflag, virtuals=edge.virtuals, direct=edge.direct
+            )
 
         return spec
 
@@ -3393,7 +3383,7 @@ class Spec:
             return True
 
         # If we have no dependencies, we can't satisfy any constraints.
-        if not self._dependencies:
+        if not self._dependencies and self.original_spec_format() >= 5 and not self.external:
             return False
 
         # If we arrived here, the lhs root node satisfies the rhs root node. Now we need to check
@@ -3404,6 +3394,7 @@ class Spec:
         # verify the edge properties, cause everything is encoded in the hash of the nodes that
         # will be verified later.
         lhs_edges: Dict[str, Set[DependencySpec]] = collections.defaultdict(set)
+        mock_nodes_from_old_specfiles = set()
         for rhs_edge in other.traverse_edges(root=False, cover="edges"):
             # If we are checking for ^mpi we need to verify if there is any edge
             if spack.repo.PATH.is_virtual(rhs_edge.spec.name):
@@ -3425,13 +3416,27 @@ class Spec:
                     except KeyError:
                         return False
 
-                candidates = current_node.dependencies(
-                    name=rhs_edge.spec.name,
-                    deptype=rhs_edge.depflag,
-                    virtuals=rhs_edge.virtuals or None,
-                )
-                if not candidates or not any(x.satisfies(rhs_edge.spec) for x in candidates):
-                    return False
+                if current_node.original_spec_format() < 5 or (
+                    current_node.original_spec_format() >= 5 and current_node.external
+                ):
+                    compiler_spec = current_node.annotations.compiler_node_attribute
+                    if compiler_spec is None:
+                        return False
+
+                    mock_nodes_from_old_specfiles.add(compiler_spec)
+                    # This checks that the single node compiler spec satisfies the request
+                    # of a direct dependency. The check is not perfect, but based on heuristic.
+                    if not compiler_spec.satisfies(rhs_edge.spec):
+                        return False
+
+                else:
+                    candidates = current_node.dependencies(
+                        name=rhs_edge.spec.name,
+                        deptype=rhs_edge.depflag,
+                        virtuals=rhs_edge.virtuals or None,
+                    )
+                    if not candidates or not any(x.satisfies(rhs_edge.spec) for x in candidates):
+                        return False
 
                 continue
 
@@ -3471,8 +3476,9 @@ class Spec:
                     return False
 
         # Edges have been checked above already, hence deps=False
+        lhs_nodes = [x for x in self.traverse(root=False)] + sorted(mock_nodes_from_old_specfiles)
         return all(
-            any(lhs.satisfies(rhs, deps=False) for lhs in self.traverse(root=False))
+            any(lhs.satisfies(rhs, deps=False) for lhs in lhs_nodes)
             for rhs in other.traverse(root=False)
         )
 
@@ -3764,26 +3770,152 @@ class Spec:
         """Equality with another spec, not including dependencies."""
         return (other is not None) and lang.lazy_eq(self._cmp_node, other._cmp_node)
 
-    def _cmp_iter(self):
-        """Lazily yield components of self for comparison."""
-
-        for item in self._cmp_node():
-            yield item
-
+    def _cmp_fast_eq(self, other) -> Optional[bool]:
+        """Short-circuit compare with other for equality, for lazy_lexicographic_ordering."""
         # If there is ever a breaking change to hash computation, whether accidental or purposeful,
         # two specs can be identical modulo DAG hash, depending on what time they were concretized
         # From the perspective of many operation in Spack (database, build cache, etc) a different
         # DAG hash means a different spec. Here we ensure that two otherwise identical specs, one
         # serialized before the hash change and one after, are considered different.
-        yield self.dag_hash() if self.concrete else None
+        if self is other:
+            return True
 
-        def deps():
-            for dep in sorted(itertools.chain.from_iterable(self._dependencies.values())):
-                yield dep.spec.name
-                yield dep.depflag
-                yield hash(dep.spec)
+        if self.concrete and other and other.concrete:
+            return self.dag_hash() == other.dag_hash()
 
-        yield deps
+        return None
+
+    def _cmp_iter(self):
+        """Lazily yield components of self for comparison."""
+
+        # Spec comparison in Spack needs to be fast, so there are several cases here for
+        # performance. The main places we care about this are:
+        #
+        #   * Abstract specs: there are lots of abstract specs in package.py files,
+        #     which are put into metadata dictionaries and sorted during concretization
+        #     setup. We want comparing abstract specs to be fast.
+        #
+        #   * Concrete specs: concrete specs are bigger and have lots of nodes and
+        #     edges. Because of the graph complexity, we need a full, linear time
+        #     traversal to compare them -- that's pretty much is unavoidable. But they
+        #     also have precoputed cryptographic hashes (dag_hash()), which we can use
+        #     to do fast equality comparison. See _cmp_fast_eq() above for the
+        #     short-circuit logic for hashes.
+        #
+        # A full traversal involves constructing data structurs, visitor objects, etc.,
+        # and it can be expensive if we have to do it to compare a bunch of tiny
+        # abstract specs. Therefore, there are 3 cases below, which avoid calling
+        # `spack.traverse.traverse_edges()` unless necessary.
+        #
+        # WARNING: the cases below need to be consistent, so don't mess with this code
+        # unless you really know what you're doing. Be sure to keep all three consistent.
+        #
+        # All cases lazily yield:
+        #
+        #   1. A generator over nodes
+        #   2. A generator over canonical edges
+        #
+        # Canonical edges have consistent ids defined by breadth-first traversal order. That is,
+        # the root is always 0, dependencies of the root are 1, 2, 3, etc., and so on.
+        #
+        # The three cases are:
+        #
+        #   1. Spec has no dependencies
+        #      * We can avoid any traversal logic and just yield this node's _cmp_node generator.
+        #
+        #   2. Spec has dependencies, but dependencies have no dependencies.
+        #      * We need to sort edges, but we don't need to track visited nodes, which
+        #        can save us the cost of setting up all the tracking data structures
+        #        `spack.traverse` uses.
+        #
+        #   3. Spec has dependencies that have dependencies.
+        #      * In this case, the spec is *probably* concrete. Equality comparisons
+        #        will be short-circuited by dag_hash(), but other comparisons will need
+        #        to lazily enumerate components of the spec. The traversal logic is
+        #        unavoidable.
+        #
+        # TODO: consider reworking `spack.traverse` to construct fewer data structures
+        # and objects, as this would make all traversals faster and could eliminate the
+        # need for the complexity here. It was not clear at the time of writing that how
+        # much optimization was possible in `spack.traverse`.
+
+        sorted_l1_edges = None
+        edge_list = None
+        node_ids = None
+
+        def nodes():
+            nonlocal sorted_l1_edges
+            nonlocal edge_list
+            nonlocal node_ids
+
+            # Level 0: root node
+            yield self._cmp_node  # always yield the root (this node)
+            if not self._dependencies:  # done if there are no dependencies
+                return
+
+            # Level 1: direct dependencies
+            # we can yield these in sorted order without tracking visited nodes
+            deps_have_deps = False
+            sorted_l1_edges = self.edges_to_dependencies(depflag=dt.ALL)
+            if len(sorted_l1_edges) > 1:
+                sorted_l1_edges = spack.traverse.sort_edges(sorted_l1_edges)
+
+            for edge in sorted_l1_edges:
+                yield edge.spec._cmp_node
+                if edge.spec._dependencies:
+                    deps_have_deps = True
+
+            if not deps_have_deps:  # done if level 1 specs have no dependencies
+                return
+
+            # Level 2: dependencies of direct dependencies
+            # now it's general; we need full traverse() to track visited nodes
+            l1_specs = [edge.spec for edge in sorted_l1_edges]
+
+            # the node_ids dict generates consistent ids based on BFS traversal order
+            # these are used to identify edges later
+            node_ids = collections.defaultdict(lambda: len(node_ids))
+            node_ids[id(self)]  # self is 0
+            for spec in l1_specs:
+                node_ids[id(spec)]  # l1 starts at 1
+
+            edge_list = []
+            for edge in spack.traverse.traverse_edges(
+                l1_specs, order="breadth", cover="edges", root=False, visited=set([0])
+            ):
+                # yield each node only once, and generate a consistent id for it the
+                # first time it's encountered.
+                if id(edge.spec) not in node_ids:
+                    yield edge.spec._cmp_node
+                    node_ids[id(edge.spec)]
+
+                if edge.parent is None:  # skip fake edge to root
+                    continue
+
+                edge_list.append(
+                    (
+                        node_ids[id(edge.parent)],
+                        node_ids[id(edge.spec)],
+                        edge.depflag,
+                        edge.virtuals,
+                    )
+                )
+
+        def edges():
+            # no edges in single-node graph
+            if not self._dependencies:
+                return
+
+            # level 1 edges all start with zero
+            for i, edge in enumerate(sorted_l1_edges, start=1):
+                yield (0, i, edge.depflag, edge.virtuals)
+
+            # yield remaining edges in the order they were encountered during traversal
+            if edge_list:
+                yield from edge_list
+
+        yield nodes
+        yield edges
 
     @property
     def namespace_if_anonymous(self):
@@ -3946,6 +4078,8 @@ class Spec:
                     except AttributeError:
                         if part == "compiler":
                             return "none"
+                        elif part == "specfile_version":
+                            return f"v{current.original_spec_format()}"
 
                         raise SpecFormatStringError(
                             f"Attempted to format attribute {attribute}. "
@@ -4471,7 +4605,7 @@ class Spec:
         return bool(self.dependencies(virtuals=(virtual,)))
 
 
-class VariantMap(lang.HashableMap):
+class VariantMap(lang.HashableMap[str, vt.VariantValue]):
     """Map containing variant instances. New values can be added only
     if the key is not already present."""
 
@@ -4481,7 +4615,7 @@ class VariantMap(lang.HashableMap):
 
     def __setitem__(self, name, vspec):
         # Raise a TypeError if vspec is not of the right type
-        if not isinstance(vspec, vt.VariantBase):
+        if not isinstance(vspec, vt.VariantValue):
             raise TypeError(
                 "VariantMap accepts only values of variant types "
                 f"[got {type(vspec).__name__} instead]"
@@ -4621,7 +4755,7 @@ class VariantMap(lang.HashableMap):
         bool_keys = []
         kv_keys = []
         for key in sorted_keys:
-            if isinstance(self[key].value, bool):
+            if self[key].type == vt.VariantType.BOOL:
                 bool_keys.append(key)
             else:
                 kv_keys.append(key)
@@ -4653,8 +4787,12 @@ def substitute_abstract_variants(spec: Spec):
     # in $spack/lib/spack/spack/spec_list.py
     unknown = []
     for name, v in spec.variants.items():
+        if v.concrete and v.type == vt.VariantType.MULTI:
+            continue
+
         if name == "dev_path":
-            spec.variants.substitute(vt.SingleValuedVariant(name, v._original_value))
+            v.type = vt.VariantType.SINGLE
+            v.concrete = True
             continue
         elif name in vt.RESERVED_NAMES:
             continue
@@ -4677,7 +4815,7 @@ def substitute_abstract_variants(spec: Spec):
         if rest:
             continue
 
-        new_variant = pkg_variant.make_variant(v._original_value)
+        new_variant = pkg_variant.make_variant(*v.values)
         pkg_variant.validate_or_raise(new_variant, spec.name)
         spec.variants.substitute(new_variant)
 
@@ -4803,7 +4941,7 @@ class SpecfileReaderBase:
                 for val in values:
                     spec.compiler_flags.add_flag(name, val, propagate)
             else:
-                spec.variants[name] = vt.MultiValuedVariant.from_node_dict(
+                spec.variants[name] = vt.VariantValue.from_node_dict(
                     name, values, propagate=propagate, abstract=name in abstract_variants
                 )
 
@@ -4829,7 +4967,7 @@ class SpecfileReaderBase:
             patches = node["patches"]
             if len(patches) > 0:
                 mvar = spec.variants.setdefault("patches", vt.MultiValuedVariant("patches", ()))
-                mvar.value = patches
+                mvar.set(*patches)
                 # FIXME: Monkey patches mvar to store patches order
                 mvar._patches_in_order_of_appearance = patches
 

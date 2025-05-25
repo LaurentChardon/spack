@@ -276,7 +276,7 @@ remove dependent packages *before* removing their dependencies or use the
 Garbage collection
 ^^^^^^^^^^^^^^^^^^
 
-When Spack builds software from sources, if often installs tools that are needed
+When Spack builds software from sources, it often installs tools that are needed
 just to build or test other software. These are not necessary at runtime.
 To support cases where removing these tools can be a benefit Spack provides
 the ``spack gc`` ("garbage collector") command, which will uninstall all unneeded packages:
@@ -1916,7 +1916,7 @@ diagnostics. Issues, if found, are reported to stdout:
    PKG-DIRECTIVES: 1 issue found
    1. lammps: wrong variant in "conflicts" directive
        the variant 'adios' does not exist
-       in /home/spack/spack/var/spack/repos/builtin/packages/lammps/package.py
+       in /home/spack/spack/var/spack/repos/spack_repo/builtin/packages/lammps/package.py
 
 
 ------------
